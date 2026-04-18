@@ -23,6 +23,6 @@ jobs:
 
       - name: 运行脚本
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
         run: python main.py
