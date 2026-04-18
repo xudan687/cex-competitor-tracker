@@ -2,12 +2,15 @@ import os
 import requests
 from openai import OpenAI
 
-# 从 GitHub Secrets 读取
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# 从 GitHub Secrets / 本地环境 读取 DeepSeek 密钥
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 LARK_WEBHOOK = os.getenv("LARK_WEBHOOK")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+# 初始化DeepSeek客户端（兼容OpenAI库格式）
+client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
+)
 def generate_report():
     prompt = """
 你是加密交易所市场分析师，请生成一段简短竞品日报，包括：
