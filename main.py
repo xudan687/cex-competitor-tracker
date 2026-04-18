@@ -2,25 +2,25 @@ import os
 import requests
 from openai import OpenAI
 
-# 从 GitHub Secrets / 本地环境 读取 DeepSeek 密钥
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-LARK_WEBHOOK = os.getenv("LARK_WEBHOOK")
 
-# 初始化DeepSeek客户端（兼容OpenAI库格式）
+if not DEEPSEEK_API_KEY:
+    raise ValueError("Missing DEEPSEEK_API_KEY")
+
 client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com"
+    base_url="https://api.deepseek.com/v1"
 )
+
 def generate_report():
-    prompt = """
-你是加密交易所市场分析师，请生成一段简短竞品日报，包括：
+    prompt = """你是加密交易所市场分析师，请生成一段简短竞品日报，包括：
 1. 市场趋势
 2. 竞品动作
 3. 对LBank建议
 """
 
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="deepseek-chat",
         messages=[
             {"role": "system", "content": prompt},
             {"role": "user", "content": "请生成一份测试竞品报告"}
@@ -36,7 +36,7 @@ def send_to_lark(text):
             "text": text
         }
     }
-    requests.post(LARK_WEBHOOK, json=data)
+    requests.post(os.getenv("LARK_WEBHOOK"), json=data)
 
 def main():
     report = generate_report()
