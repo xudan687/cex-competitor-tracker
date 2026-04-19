@@ -1,9 +1,9 @@
 import os
 import requests
 import datetime
-import feedparser
-from dateutil import parser
+from bs4 import BeautifulSoup
 from openai import OpenAI
+import json
 
 # ========= 配置 =========
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -16,165 +16,121 @@ client = OpenAI(
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ✅ 修复：统一为带时区 UTC
 NOW = datetime.datetime.now(datetime.timezone.utc)
 
-# ========= 时间处理 =========
+# ========= 时间过滤 =========
 
-def parse_time(entry):
-    try:
-        if hasattr(entry, "published"):
-            dt = parser.parse(entry.published)
-        elif hasattr(entry, "updated"):
-            dt = parser.parse(entry.updated)
-        else:
-            return None
+def within_7d(dt):
+    return (NOW - dt).total_seconds() < 7 * 86400
 
-        # 统一UTC
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
+# ========= 抓 Bitget Blog =========
 
-        return dt
-    except:
-        return None
+def fetch_bitget_articles():
+    url = "https://www.bitget.com/blog"
+    html = requests.get(url, headers=HEADERS, timeout=10).text
+    soup = BeautifulSoup(html, "html.parser")
 
+    articles = []
 
-def within_24h(dt):
-    if not dt:
-        return False
-    return (NOW - dt).total_seconds() < 86400
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
 
-
-# ========= 标签系统 =========
-
-def tag_content(text):
-    text = text.lower()
-
-    if any(k in text for k in ["launch", "listing"]):
-        return "上币"
-
-    if any(k in text for k in ["campaign", "reward", "event"]):
-        return "活动"
-
-    if any(k in text for k in ["partnership", "collaboration"]):
-        return "品牌"
-
-    return "其他"
-
-
-# ========= RSS抓取 =========
-
-def fetch_rss(name, url):
-    feed = feedparser.parse(url)
-    results = []
-
-    for entry in feed.entries[:10]:
-        dt = parse_time(entry)
-
-        if not within_24h(dt):
+        if "/blog/articles/" not in href:
             continue
 
-        title = entry.title if hasattr(entry, "title") else ""
-        link = entry.link if hasattr(entry, "link") else ""
+        link = "https://www.bitget.com" + href
 
-        tag = tag_content(title)
+        title = a.get_text(strip=True)
 
-        results.append(f"[{name}][{tag}]\n{title}\n{link}")
+        # 简单过滤无效标题
+        if len(title) < 10:
+            continue
+
+        articles.append({
+            "exchange": "Bitget",
+            "title": title,
+            "link": link,
+            "source": "official"
+        })
+
+    # 去重
+    unique = {item["link"]: item for item in articles}
+
+    return list(unique.values())[:10]
+
+
+# ========= 抓详情页（补时间） =========
+
+def enrich_with_time(items):
+    results = []
+
+    for item in items:
+        try:
+            html = requests.get(item["link"], headers=HEADERS, timeout=10).text
+            soup = BeautifulSoup(html, "html.parser")
+
+            text = soup.get_text()
+
+            # 简单找日期（YYYY-MM-DD）
+            import re
+            match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+
+            if not match:
+                continue
+
+            dt = datetime.datetime.strptime(match.group(), "%Y-%m-%d")
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+
+            if not within_7d(dt):
+                continue
+
+            item["published_at"] = match.group()
+
+            results.append(item)
+
+        except:
+            continue
 
     return results
 
 
-# ========= 官方源 =========
-
-def fetch_official():
-    data = []
-
-    # ✅ Bybit 官方 RSS（稳定）
-    data += fetch_rss("Bybit", "https://www.bybit.com/en/press/rss")
-
-    # ✅ 可扩展其他官方源
-    return data
-
-
-# ========= 媒体源 =========
-
-def fetch_media():
-    data = []
-
-    # ⚠️ 不是所有tag都有RSS，所以只用稳定源
-    MEDIA_FEEDS = {
-        "Cointelegraph": "https://cointelegraph.com/rss",
-        "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/"
-    }
-
-    KEYWORDS = ["bybit", "okx", "bitget", "mexc", "gate"]
-
-    for name, url in MEDIA_FEEDS.items():
-        feed = feedparser.parse(url)
-
-        for entry in feed.entries[:20]:
-            dt = parse_time(entry)
-
-            if not within_24h(dt):
-                continue
-
-            title = entry.title.lower()
-
-            if not any(k in title for k in KEYWORDS):
-                continue
-
-            link = entry.link
-            tag = tag_content(title)
-
-            data.append(f"[Media-{name}][{tag}]\n{entry.title}\n{link}")
-
-    return data
-
-
-# ========= 汇总 =========
-
-def collect_data():
-    data = []
-
-    data += fetch_official()
-    data += fetch_media()
-
-    return "\n\n".join(data)
-
-
 # ========= AI分析 =========
 
-def generate_report(raw):
+def generate_report(items):
     today = NOW.strftime("%Y-%m-%d")
+
+    raw = json.dumps(items, ensure_ascii=False, indent=2)
 
     prompt = f"""
 你是加密交易所竞品分析师。
 
 当前时间：{today}
-分析范围：过去24小时
+分析范围：过去7天
 
-以下是数据：
+以下是Bitget官方Blog数据：
 
 {raw}
 
 要求：
 
-1. 只基于数据分析
-2. 每个交易所提炼1个最大动态
-3. 输出结构：
+1. 只基于这些数据分析，不允许编造
+2. 提炼：
+   - 1个最重要动态
+   - 其他关键动作
+3. 每条结论必须对应原始title
+4. 输出：
 
-【竞品核心动态】
-【逐家拆解】
+【Bitget核心动态】
+【关键动作拆解】
 【LBank可执行建议】
 
-4. 媒体优先级高
-5. 不允许编造
+5. 如果数据不足，直接说明
 """
 
     res = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
+        temperature=0.2
     )
 
     return res.choices[0].message.content
@@ -192,11 +148,14 @@ def send_to_lark(text):
 # ========= 主 =========
 
 def main():
-    print("抓取数据...")
-    raw = collect_data()
+    print("抓Bitget列表...")
+    articles = fetch_bitget_articles()
+
+    print("解析时间...")
+    articles = enrich_with_time(articles)
 
     print("AI分析...")
-    report = generate_report(raw)
+    report = generate_report(articles)
 
     print("发送...")
     send_to_lark(report)
