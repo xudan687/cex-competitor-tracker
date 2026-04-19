@@ -1,128 +1,159 @@
 import os
 import requests
 import datetime
-from bs4 import BeautifulSoup
+import feedparser
+from dateutil import parser
 from openai import OpenAI
 
-# ========== 配置 ==========
+# ========= 配置 =========
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 LARK_WEBHOOK = os.getenv("LARK_WEBHOOK")
-
-if not DEEPSEEK_API_KEY:
-    raise ValueError("Missing DEEPSEEK_API_KEY")
 
 client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com/v1"
 )
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+NOW = datetime.datetime.utcnow()
 
-# ========== 抓取函数 ==========
+# ========= 时间过滤 =========
 
-def fetch_mexc():
-    url = "https://www.mexc.com/announcements/latest-events"
-    resp = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text()[:2000]
+def within_24h(dt):
+    return (NOW - dt).total_seconds() < 86400
 
-def fetch_gate():
-    url = "https://www.gate.com/zh/announcements"
-    resp = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text()[:2000]
+# ========= 标签系统 =========
 
-def fetch_bitget():
-    url = "https://www.bitget.com/blog"
-    resp = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return soup.get_text()[:2000]
+def tag_content(text):
+    text = text.lower()
+    if "launch" in text or "listing" in text:
+        return "上币"
+    if "campaign" in text or "reward" in text:
+        return "活动"
+    if "partnership" in text:
+        return "品牌"
+    return "其他"
 
-# ========== 汇总数据 ==========
+# ========= RSS抓取（核心） =========
 
-def collect_data():
-    data = ""
+def fetch_rss(name, url):
+    feed = feedparser.parse(url)
+    results = []
 
+    for entry in feed.entries[:10]:
+        try:
+            dt = parser.parse(entry.published)
+        except:
+            continue
+
+        if not within_24h(dt):
+            continue
+
+        title = entry.title
+        link = entry.link
+        tag = tag_content(title)
+
+        results.append(f"[{name}][{tag}]\n{title}\n{link}")
+
+    return results
+
+# ========= 官方源 =========
+
+def fetch_official():
+    data = []
+
+    # Bybit 官方
+    data += fetch_rss("Bybit", "https://www.bybit.com/en/press/rss")
+
+    # MEXC（无RSS，用fallback）
     try:
-        data += "\n[MEXC]\n" + fetch_mexc()
+        html = requests.get("https://www.mexc.com/announcements/latest-events").text
+        if "2026" in html:
+            data.append("[MEXC][活动]\n最新公告页\nhttps://www.mexc.com/announcements/latest-events")
     except:
-        data += "\n[MEXC] 抓取失败"
-
-    try:
-        data += "\n[Gate]\n" + fetch_gate()
-    except:
-        data += "\n[Gate] 抓取失败"
-
-    try:
-        data += "\n[Bitget]\n" + fetch_bitget()
-    except:
-        data += "\n[Bitget] 抓取失败"
+        pass
 
     return data
 
-# ========== AI分析 ==========
+# ========= 媒体源（高优先级） =========
 
-def generate_report(raw_data):
-    today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-    yesterday = (datetime.datetime.utcnow() - datetime.timedelta(hours=24)).strftime("%Y-%m-%d")
+def fetch_media():
+    data = []
+
+    KEYWORDS = ["bybit", "okx", "bitget", "mexc", "gate"]
+
+    for kw in KEYWORDS:
+        url = f"https://cointelegraph.com/rss/tag/{kw}"
+
+        data += fetch_rss(f"Media-{kw}", url)
+
+    return data
+
+# ========= 汇总 =========
+
+def collect_data():
+    data = []
+
+    data += fetch_official()
+    data += fetch_media()
+
+    return "\n\n".join(data)
+
+# ========= AI分析 =========
+
+def generate_report(raw):
+    today = NOW.strftime("%Y-%m-%d")
 
     prompt = f"""
-你是加密交易所竞品情报分析师。
+你是加密交易所竞品分析师。
 
 当前时间：{today}
-分析范围：过去24小时（{yesterday} - {today}）
+分析范围：过去24小时
 
-以下是抓取的真实竞品数据：
+以下是结构化数据：
 
-{raw_data}
-
-请生成竞品日报：
+{raw}
 
 要求：
-1. 只基于提供的数据，不允许编造
-2. 每家交易所提炼1个最重要动态
-3. 其他用标题列出
-4. 输出结构：
+
+1. 只基于数据分析
+2. 每家交易所提炼1个最大动态
+3. 按交易所拆解
+4. 输出：
 
 【竞品核心动态】
 【逐家拆解】
 【LBank可执行建议】
 
-5. 如果没有有效信息，写“无重大更新”
+5. 媒体来源权重更高
+6. 不允许编造
 """
 
-    response = client.chat.completions.create(
+    res = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.3
     )
 
-    return response.choices[0].message.content
+    return res.choices[0].message.content
 
-# ========== 飞书推送 ==========
+# ========= 飞书 =========
 
 def send_to_lark(text):
-    data = {
+    requests.post(LARK_WEBHOOK, json={
         "msg_type": "text",
-        "content": {
-            "text": text
-        }
-    }
+        "content": {"text": text}
+    })
 
-    requests.post(LARK_WEBHOOK, json=data)
-
-# ========== 主函数 ==========
+# ========= 主 =========
 
 def main():
-    print("开始抓取数据...")
-    raw_data = collect_data()
+    print("抓取数据...")
+    raw = collect_data()
 
-    print("开始AI分析...")
-    report = generate_report(raw_data)
+    print("AI分析...")
+    report = generate_report(raw)
 
-    print("发送到飞书...")
+    print("发送...")
     send_to_lark(report)
 
     print("完成")
