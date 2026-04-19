@@ -1,9 +1,10 @@
 import os
 import requests
 import datetime
+import json
+import re
 from bs4 import BeautifulSoup
 from openai import OpenAI
-import json
 
 # ========= 配置 =========
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -15,22 +16,53 @@ client = OpenAI(
 )
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-
 NOW = datetime.datetime.now(datetime.timezone.utc)
 
-# ========= 时间过滤 =========
-
+# ========= 时间 =========
 def within_7d(dt):
     return (NOW - dt).total_seconds() < 7 * 86400
 
-# ========= 抓 Bitget Blog =========
+# ========= 分类系统 =========
+def classify(title):
+    t = title.lower()
 
-def fetch_bitget_articles():
+    if any(k in t for k in ["launchpool", "earn", "apr", "reward", "campaign", "bonus", "airdrop"]):
+        return "活动"
+
+    if any(k in t for k in ["launch", "listing", "lists"]):
+        return "上币"
+
+    if any(k in t for k in ["copy trading", "futures", "feature", "trading"]):
+        return "产品"
+
+    if any(k in t for k in ["partnership", "collaboration"]):
+        return "品牌"
+
+    if any(k in t for k in ["register", "license", "compliance"]):
+        return "合规"
+
+    return "其他"
+
+# ========= 优先级 =========
+def score(item):
+    base = 1
+
+    if item["category"] == "活动":
+        base += 3
+    if item["category"] == "上币":
+        base += 2
+    if item["category"] == "产品":
+        base += 2
+
+    return base
+
+# ========= 抓取 =========
+def fetch_bitget():
     url = "https://www.bitget.com/blog"
-    html = requests.get(url, headers=HEADERS, timeout=10).text
+    html = requests.get(url, headers=HEADERS).text
     soup = BeautifulSoup(html, "html.parser")
 
-    articles = []
+    results = []
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -38,93 +70,73 @@ def fetch_bitget_articles():
         if "/blog/articles/" not in href:
             continue
 
-        link = "https://www.bitget.com" + href
-
         title = a.get_text(strip=True)
-
-        # 简单过滤无效标题
-        if len(title) < 10:
+        if len(title) < 15:
             continue
 
-        articles.append({
+        link = "https://www.bitget.com" + href
+
+        parent_text = a.parent.get_text(" ", strip=True)
+
+        match = re.search(r"\d{4}-\d{2}-\d{2}", parent_text)
+        if not match:
+            continue
+
+        dt = datetime.datetime.strptime(match.group(), "%Y-%m-%d")
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+
+        if not within_7d(dt):
+            continue
+
+        category = classify(title)
+
+        results.append({
             "exchange": "Bitget",
             "title": title,
             "link": link,
-            "source": "official"
+            "published_at": match.group(),
+            "category": category
         })
 
     # 去重
-    unique = {item["link"]: item for item in articles}
+    unique = {x["link"]: x for x in results}
 
-    return list(unique.values())[:10]
+    # 排序（重要）
+    sorted_items = sorted(unique.values(), key=score, reverse=True)
 
+    return sorted_items[:6]
 
-# ========= 抓详情页（补时间） =========
-
-def enrich_with_time(items):
-    results = []
-
-    for item in items:
-        try:
-            html = requests.get(item["link"], headers=HEADERS, timeout=10).text
-            soup = BeautifulSoup(html, "html.parser")
-
-            text = soup.get_text()
-
-            # 简单找日期（YYYY-MM-DD）
-            import re
-            match = re.search(r"\d{4}-\d{2}-\d{2}", text)
-
-            if not match:
-                continue
-
-            dt = datetime.datetime.strptime(match.group(), "%Y-%m-%d")
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-
-            if not within_7d(dt):
-                continue
-
-            item["published_at"] = match.group()
-
-            results.append(item)
-
-        except:
-            continue
-
-    return results
-
-
-# ========= AI分析 =========
-
+# ========= AI =========
 def generate_report(items):
-    today = NOW.strftime("%Y-%m-%d")
-
     raw = json.dumps(items, ensure_ascii=False, indent=2)
 
     prompt = f"""
 你是加密交易所竞品分析师。
 
-当前时间：{today}
-分析范围：过去7天
-
-以下是Bitget官方Blog数据：
+以下是Bitget过去7天真实Blog数据（含标题+时间+链接）：
 
 {raw}
 
-要求：
+严格要求：
 
-1. 只基于这些数据分析，不允许编造
-2. 提炼：
-   - 1个最重要动态
-   - 其他关键动作
-3. 每条结论必须对应原始title
-4. 输出：
+1. 只能基于数据分析，不允许编造
+2. 每条结论必须引用原始link
+3. 不允许扩展未提供信息
+4. 不允许出现Bitget以外交易所
+5. 分类优先级：活动 > 上币 > 产品 > 其他
+
+输出结构：
 
 【Bitget核心动态】
-【关键动作拆解】
-【LBank可执行建议】
+（1条最重要，必须带link）
 
-5. 如果数据不足，直接说明
+【关键动作拆解】
+（3-5条，每条带link）
+
+【LBank可执行建议】
+（必须结合以上动作）
+
+输出要像专业周报
 """
 
     res = client.chat.completions.create(
@@ -135,33 +147,25 @@ def generate_report(items):
 
     return res.choices[0].message.content
 
-
 # ========= 飞书 =========
-
 def send_to_lark(text):
     requests.post(LARK_WEBHOOK, json={
         "msg_type": "text",
         "content": {"text": text}
     })
 
-
 # ========= 主 =========
-
 def main():
-    print("抓Bitget列表...")
-    articles = fetch_bitget_articles()
-
-    print("解析时间...")
-    articles = enrich_with_time(articles)
+    print("抓取Bitget...")
+    items = fetch_bitget()
 
     print("AI分析...")
-    report = generate_report(articles)
+    report = generate_report(items)
 
     print("发送...")
     send_to_lark(report)
 
     print("完成")
-
 
 if __name__ == "__main__":
     main()
